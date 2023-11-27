@@ -28,7 +28,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/compose-spec/compose-go/types"
 	"github.com/docker/cli/cli"
+	compose2 "github.com/docker/compose/v2/cmd/compose"
+	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v2/pkg/compose"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -37,9 +41,7 @@ import (
 	"github.com/docker/compose-cli/api/config"
 	apicontext "github.com/docker/compose-cli/api/context"
 	"github.com/docker/compose-cli/api/context/store"
-	"github.com/docker/compose-cli/api/errdefs"
 	"github.com/docker/compose-cli/cli/cmd"
-	"github.com/docker/compose-cli/cli/cmd/compose"
 	contextcmd "github.com/docker/compose-cli/cli/cmd/context"
 	"github.com/docker/compose-cli/cli/cmd/login"
 	"github.com/docker/compose-cli/cli/cmd/logout"
@@ -59,6 +61,7 @@ import (
 )
 
 var (
+	metricsClient           metrics.Client
 	contextAgnosticCommands = map[string]struct{}{
 		"context":          {},
 		"login":            {},
@@ -66,6 +69,9 @@ var (
 		"serve":            {},
 		"version":          {},
 		"backend-metadata": {},
+		// Special hidden commands used by cobra for completion
+		"__complete":       {},
+		"__completeNoDesc": {},
 	}
 	unknownCommandRegexp = regexp.MustCompile(`unknown docker command: "([^"]*)"`)
 )
@@ -81,6 +87,12 @@ func init() {
 	if err := os.Setenv("PATH", appendPaths(os.Getenv("PATH"), path)); err != nil {
 		panic(err)
 	}
+
+	metricsClient = metrics.NewDefaultClient()
+	metricsClient.WithCliVersionFunc(func() string {
+		return mobycli.CliVersion()
+	})
+
 	// Seed random
 	rand.Seed(time.Now().UnixNano())
 }
@@ -96,10 +108,14 @@ func isContextAgnosticCommand(cmd *cobra.Command) bool {
 	if cmd == nil {
 		return false
 	}
-	if _, ok := contextAgnosticCommands[cmd.Name()]; ok {
+	if _, ok := contextAgnosticCommands[cmd.Name()]; ok && isFirstLevelCommand(cmd) {
 		return true
 	}
 	return isContextAgnosticCommand(cmd.Parent())
+}
+
+func isFirstLevelCommand(cmd *cobra.Command) bool {
+	return !cmd.HasParent() || !cmd.Parent().HasParent()
 }
 
 func main() {
@@ -165,7 +181,7 @@ func main() {
 	})
 
 	// populate the opts with the global flags
-	flags.Parse(os.Args[1:]) //nolint: errcheck
+	flags.Parse(os.Args[1:]) // nolint: errcheck
 
 	level, err := logrus.ParseLevel(opts.LogLevel)
 	if err != nil {
@@ -209,8 +225,14 @@ func main() {
 	if cc != nil {
 		ctype = cc.Type()
 	}
+	ctx = context.WithValue(ctx, config.ContextTypeKey, ctype)
 
-	service, err := getBackend(ctype, configDir, opts)
+	initLocalFn := func() (backend.Service, error) {
+		return local.GetLocalBackend(configDir, opts)
+	}
+	backend.Register(store.DefaultContextType, store.DefaultContextType, initLocalFn, nil)
+	backend.Register(store.LocalContextType, store.LocalContextType, initLocalFn, nil)
+	service, err := backend.Get(ctype)
 	if err != nil {
 		fatal(err)
 	}
@@ -221,59 +243,110 @@ func main() {
 		volume.Command(ctype),
 	)
 
-	if ctype != store.DefaultContextType {
-		// On default context, "compose" is implemented by CLI Plugin
-		root.AddCommand(compose.RootCommand(ctype, service.ComposeService()))
+	// On default context, "compose" is implemented by CLI Plugin
+	proxy := api.NewServiceProxy().WithService(service.ComposeService())
+	command := compose2.RootCommand(proxy)
+
+	if ctype == store.AciContextType {
+		customizeCliForACI(command, proxy)
 	}
 
-	if err = root.ExecuteContext(ctx); err != nil {
-		handleError(ctx, err, ctype, currentContext, cc, root)
+	root.AddCommand(command)
+
+	start := time.Now().UTC()
+	err = root.ExecuteContext(ctx)
+	duration := time.Since(start)
+	if err != nil {
+		handleError(ctx, err, ctype, currentContext, cc, root, start, duration)
 	}
-	metrics.Track(ctype, os.Args[1:], metrics.SuccessStatus)
+	metricsClient.Track(
+		metrics.CmdResult{
+			ContextType: ctype,
+			Args:        os.Args[1:],
+			Status:      metrics.SuccessStatus,
+			Start:       start,
+			Duration:    duration,
+		})
 }
 
-func getBackend(ctype string, configDir string, opts cliopts.GlobalOpts) (backend.Service, error) {
-	switch ctype {
-	case store.DefaultContextType, store.LocalContextType:
-		return local.GetLocalBackend(configDir, opts)
+func customizeCliForACI(command *cobra.Command, proxy *api.ServiceProxy) {
+	var domainName string
+	for _, c := range command.Commands() {
+		if c.Name() == "up" {
+			c.Flags().StringVar(&domainName, "domainname", "", "Container NIS domain name")
+			proxy.WithInterceptor(func(ctx context.Context, project *types.Project) {
+				if domainName != "" {
+					// arbitrarily set the domain name on the first service ; ACI backend will expose the entire project
+					project.Services[0].DomainName = domainName
+				}
+
+			})
+		}
 	}
-	service, err := backend.Get(ctype)
-	if errdefs.IsNotFoundError(err) {
-		return service, nil
-	}
-	return service, err
 }
 
-func handleError(ctx context.Context, err error, ctype string, currentContext string, cc *store.DockerContext, root *cobra.Command) {
+func handleError(
+	ctx context.Context,
+	err error,
+	ctype string,
+	currentContext string,
+	cc *store.DockerContext,
+	root *cobra.Command,
+	start time.Time,
+	duration time.Duration,
+) {
 	// if user canceled request, simply exit without any error message
-	if errdefs.IsErrCanceled(err) || errors.Is(ctx.Err(), context.Canceled) {
-		metrics.Track(ctype, os.Args[1:], metrics.CanceledStatus)
+	if api.IsErrCanceled(err) || errors.Is(ctx.Err(), context.Canceled) {
+		metricsClient.Track(
+			metrics.CmdResult{
+				ContextType: ctype,
+				Args:        os.Args[1:],
+				Status:      metrics.CanceledStatus,
+				Start:       start,
+				Duration:    duration,
+			},
+		)
 		os.Exit(130)
 	}
 	if ctype == store.AwsContextType {
-		exit(currentContext, errors.Errorf(`%q context type has been renamed. Recreate the context by running:
-$ docker context create %s <name>`, cc.Type(), store.EcsContextType), ctype)
+		exit(
+			currentContext,
+			errors.Errorf(`%q context type has been renamed. Recreate the context by running:
+$ docker context create %s <name>`, cc.Type(), store.EcsContextType),
+			ctype,
+			start,
+			duration,
+		)
 	}
 
 	// Context should always be handled by new CLI
 	requiredCmd, _, _ := root.Find(os.Args[1:])
 	if requiredCmd != nil && isContextAgnosticCommand(requiredCmd) {
-		exit(currentContext, err, ctype)
+		exit(currentContext, err, ctype, start, duration)
 	}
 	mobycli.ExecIfDefaultCtxType(ctx, root)
 
 	checkIfUnknownCommandExistInDefaultContext(err, currentContext, ctype)
 
-	exit(currentContext, err, ctype)
+	exit(currentContext, err, ctype, start, duration)
 }
 
-func exit(ctx string, err error, ctype string) {
+func exit(ctx string, err error, ctype string, start time.Time, duration time.Duration) {
 	if exit, ok := err.(cli.StatusError); ok {
-		metrics.Track(ctype, os.Args[1:], metrics.SuccessStatus)
+		// TODO(milas): shouldn't this use the exit code to determine status?
+		metricsClient.Track(
+			metrics.CmdResult{
+				ContextType: ctype,
+				Args:        os.Args[1:],
+				Status:      metrics.SuccessStatus,
+				Start:       start,
+				Duration:    duration,
+			},
+		)
 		os.Exit(exit.StatusCode)
 	}
 
-	var composeErr metrics.ComposeError
+	var composeErr compose.Error
 	metricsStatus := metrics.FailureStatus
 	exitCode := 1
 	if errors.As(err, &composeErr) {
@@ -284,21 +357,29 @@ func exit(ctx string, err error, ctype string) {
 		metricsStatus = metrics.CommandSyntaxFailure.MetricsStatus
 		exitCode = metrics.CommandSyntaxFailure.ExitCode
 	}
-	metrics.Track(ctype, os.Args[1:], metricsStatus)
+	metricsClient.Track(
+		metrics.CmdResult{
+			ContextType: ctype,
+			Args:        os.Args[1:],
+			Status:      metricsStatus,
+			Start:       start,
+			Duration:    duration,
+		},
+	)
 
-	if errors.Is(err, errdefs.ErrLoginRequired) {
+	if errors.Is(err, api.ErrLoginRequired) {
 		fmt.Fprintln(os.Stderr, err)
-		os.Exit(errdefs.ExitCodeLoginRequired)
+		os.Exit(api.ExitCodeLoginRequired)
 	}
 
-	if compose.Warning != "" {
+	if compose2.Warning != "" {
 		logrus.Warn(err)
-		fmt.Fprintln(os.Stderr, compose.Warning)
+		fmt.Fprintln(os.Stderr, compose2.Warning)
 	}
 
-	if errors.Is(err, errdefs.ErrNotImplemented) {
+	if errors.Is(err, api.ErrNotImplemented) {
 		name := metrics.GetCommand(os.Args[1:])
-		fmt.Fprintf(os.Stderr, "Command %q not available in current context (%s)\n", name, ctx)
+		fmt.Fprintf(os.Stderr, "Command %q not available in current context (%s). %q\n", name, ctx, err)
 
 		os.Exit(1)
 	}
@@ -319,7 +400,11 @@ func checkIfUnknownCommandExistInDefaultContext(err error, currentContext string
 
 		if mobycli.IsDefaultContextCommand(dockerCommand) {
 			fmt.Fprintf(os.Stderr, "Command %q not available in current context (%s), you can use the \"default\" context to run this command\n", dockerCommand, currentContext)
-			metrics.Track(contextType, os.Args[1:], metrics.FailureStatus)
+			metricsClient.Track(metrics.CmdResult{
+				ContextType: contextType,
+				Args:        os.Args[1:],
+				Status:      metrics.FailureStatus,
+			})
 			os.Exit(1)
 		}
 	}

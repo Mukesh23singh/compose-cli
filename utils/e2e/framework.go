@@ -17,10 +17,8 @@
 package e2e
 
 import (
-	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"os/exec"
@@ -31,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/icmd"
@@ -70,12 +69,12 @@ func NewE2eCLI(t *testing.T, binDir string) *E2eCLI {
 }
 
 func newE2eCLI(t *testing.T, binDir string) *E2eCLI {
-	d, err := ioutil.TempDir("", "")
+	d, err := os.MkdirTemp("", "")
 	assert.Check(t, is.Nil(err))
 
 	t.Cleanup(func() {
 		if t.Failed() {
-			conf, _ := ioutil.ReadFile(filepath.Join(d, "config.json"))
+			conf, _ := os.ReadFile(filepath.Join(d, "config.json"))
 			t.Errorf("Config: %s\n", string(conf))
 			t.Error("Contents of config dir:")
 			for _, p := range dirContents(d) {
@@ -90,10 +89,15 @@ func newE2eCLI(t *testing.T, binDir string) *E2eCLI {
 	if runtime.GOOS == "windows" {
 		composePluginFile += ".exe"
 	}
-	composePlugin, _ := findExecutable(composePluginFile, []string{"../../bin", "../../../bin"})
-	err = CopyFile(composePlugin, filepath.Join(d, "cli-plugins", composePluginFile))
-	if err != nil {
-		panic(err)
+	composePlugin, err := findExecutable(composePluginFile, []string{"../../bin", "../../../bin"})
+	if os.IsNotExist(err) {
+		fmt.Println("WARNING: docker-compose cli-plugin not found")
+	}
+	if err == nil {
+		err = CopyFile(composePlugin, filepath.Join(d, "cli-plugins", composePluginFile))
+		if err != nil {
+			panic(err)
+		}
 	}
 
 	return &E2eCLI{binDir, d, t}
@@ -119,7 +123,7 @@ func SetupExistingCLI() (string, func(), error) {
 		}
 	}
 
-	d, err := ioutil.TempDir("", "")
+	d, err := os.MkdirTemp("", "")
 	if err != nil {
 		return "", nil, err
 	}
@@ -158,7 +162,7 @@ func findExecutable(executableName string, paths []string) (string, error) {
 		return bin, nil
 	}
 
-	return "", errors.New("executable not found")
+	return "", errors.Wrap(os.ErrNotExist, "executable not found")
 }
 
 // CopyFile copies a file from a sourceFile to a destinationFile setting permissions to 0755
@@ -210,13 +214,13 @@ func (c *E2eCLI) NewDockerCmd(args ...string) icmd.Cmd {
 
 // RunDockerOrExitError runs a docker command and returns a result
 func (c *E2eCLI) RunDockerOrExitError(args ...string) *icmd.Result {
-	fmt.Printf("	[%s] docker %s\n", c.test.Name(), strings.Join(args, " "))
+	fmt.Printf("\t[%s] docker %s\n", c.test.Name(), strings.Join(args, " "))
 	return icmd.RunCmd(c.NewDockerCmd(args...))
 }
 
 // RunCmd runs a command, expects no error and returns a result
 func (c *E2eCLI) RunCmd(args ...string) *icmd.Result {
-	fmt.Printf("	[%s] %s\n", c.test.Name(), strings.Join(args, " "))
+	fmt.Printf("\t[%s] %s\n", c.test.Name(), strings.Join(args, " "))
 	assert.Assert(c.test, len(args) >= 1, "require at least one command in parameters")
 	res := icmd.RunCmd(c.NewCmd(args[0], args[1:]...))
 	res.Assert(c.test, icmd.Success)
@@ -242,7 +246,7 @@ func (c *E2eCLI) WaitForCmdResult(command icmd.Cmd, predicate func(*icmd.Result)
 	assert.Assert(c.test, timeout.Nanoseconds() > delay.Nanoseconds(), "timeout must be greater than delay")
 	var res *icmd.Result
 	checkStopped := func(logt poll.LogT) poll.Result {
-		fmt.Printf("	[%s] %s\n", c.test.Name(), strings.Join(command.Command, " "))
+		fmt.Printf("\t[%s] %s\n", c.test.Name(), strings.Join(command.Command, " "))
 		res = icmd.RunCmd(command)
 		if !predicate(res) {
 			return poll.Continue("Cmd output did not match requirement: %q", res.Combined())
@@ -281,7 +285,7 @@ func GoldenFile(name string) string {
 	return name + ".golden"
 }
 
-//Lines split output into lines
+// Lines split output into lines
 func Lines(output string) []string {
 	return strings.Split(strings.TrimSpace(output), "\n")
 }
@@ -297,7 +301,7 @@ func HTTPGetWithRetry(t *testing.T, endpoint string, expectedStatus int, retryDe
 	client := &http.Client{
 		Timeout: retryDelay,
 	}
-	fmt.Printf("	[%s] GET %s\n", t.Name(), endpoint)
+	fmt.Printf("\t[%s] GET %s\n", t.Name(), endpoint)
 	checkUp := func(t poll.LogT) poll.Result {
 		r, err = client.Get(endpoint)
 		if err != nil {
@@ -310,7 +314,7 @@ func HTTPGetWithRetry(t *testing.T, endpoint string, expectedStatus int, retryDe
 	}
 	poll.WaitOn(t, checkUp, poll.WithDelay(retryDelay), poll.WithTimeout(timeout))
 	if r != nil {
-		b, err := ioutil.ReadAll(r.Body)
+		b, err := io.ReadAll(r.Body)
 		assert.NilError(t, err)
 		return string(b)
 	}

@@ -22,15 +22,16 @@ import (
 	cliconfig "github.com/docker/cli/cli/config"
 	"github.com/docker/docker/client"
 
+	"github.com/docker/compose/v2/pkg/api"
+	"github.com/docker/compose/v2/pkg/compose"
+
 	"github.com/docker/compose-cli/api/backend"
 	"github.com/docker/compose-cli/api/cloud"
-	"github.com/docker/compose-cli/api/compose"
 	"github.com/docker/compose-cli/api/containers"
 	"github.com/docker/compose-cli/api/context/store"
 	"github.com/docker/compose-cli/api/resources"
 	"github.com/docker/compose-cli/api/secrets"
 	"github.com/docker/compose-cli/api/volumes"
-	local_compose "github.com/docker/compose-cli/local/compose"
 )
 
 const backendType = store.EcsLocalSimulationContextType
@@ -41,7 +42,7 @@ func init() {
 
 type ecsLocalSimulation struct {
 	moby    *client.Client
-	compose compose.Service
+	compose api.Service
 }
 
 func service() (backend.Service, error) {
@@ -52,7 +53,7 @@ func service() (backend.Service, error) {
 
 	return &ecsLocalSimulation{
 		moby:    apiClient,
-		compose: local_compose.NewComposeService(apiClient, cliconfig.LoadDefaultConfigFile(os.Stderr)),
+		compose: compose.NewComposeService(apiClient, cliconfig.LoadDefaultConfigFile(os.Stderr)),
 	}, nil
 }
 
@@ -72,7 +73,7 @@ func (e ecsLocalSimulation) SecretsService() secrets.Service {
 	return nil
 }
 
-func (e ecsLocalSimulation) ComposeService() compose.Service {
+func (e ecsLocalSimulation) ComposeService() api.Service {
 	return e
 }
 
